@@ -4,10 +4,12 @@ import {
     debounce,
     FileSystemAdapter,
     MarkdownView,
+    Modal,
     normalizePath,
     Notice,
     Platform,
     Plugin,
+    requestUrl,
     TFile,
     TFolder,
     moment,
@@ -62,6 +64,93 @@ import {
 import { DiscardModal, type DiscardResult } from "./ui/modals/discardModal";
 import { HunkActions } from "./editor/signs/hunkActions";
 import { EditorIntegration } from "./editor/editorIntegration";
+
+// ============================================================================
+// 05번 설계 문서: Obsidian-Git auto-commit 사전검사 설계
+// Source of truth: pi-knowledge-base/02_개인/이한덕/Obsidian-Git 이슈/05_*.md
+// ============================================================================
+
+/**
+ * autostash 식별용 stash 메시지 prefix.
+ * 03번 stash push 호출과 05번 _preflightCheck 검사 1-A가 동일 상수를
+ * substring 매칭으로 사용한다. 정규식 금지, 하이픈 변형 금지.
+ */
+const OBSIDIAN_GIT_AUTOSTASH_TAG = "obsidian-git autostash";
+
+/**
+ * Captain Hook 디스코드 webhook URL. 충돌/사전검사 알림 모두 동일 채널 사용.
+ */
+const CAPTAIN_HOOK_WEBHOOK_URL =
+    "https://discord.com/api/webhooks/1489414668861706250/NAmGdTejGlkCW_oitzN39gWZ1uKJdfWC3ntdz5kDcrNGf1hy_brI6bWFYP9xX_hx93HP";
+
+/**
+ * 이한덕 Discord 멘션 ID (Captain Hook 알림 수신자).
+ */
+const CAPTAIN_HOOK_MENTION_ID = "1480357717288681473";
+
+/**
+ * mass-delete 임계치. Phase 0과 Phase 0.5에서 동일 값 사용.
+ */
+const MASS_DELETE_THRESHOLD = 30;
+
+/**
+ * Modal 자동 닫힘 시간 (ms). 확인 버튼 없이 10초 후 자동 close.
+ */
+const MODAL_AUTO_CLOSE_MS = 10000;
+
+/**
+ * 사전검사 danger 정보 타입.
+ */
+interface PreflightDanger {
+    prefix: string;
+    detail: string;
+}
+
+/**
+ * 사전검사 경고용 Obsidian Modal.
+ * - 확인 버튼 없음
+ * - 10초 후 자동 close (setTimeout)
+ * - ESC 키 또는 바깥 클릭으로 즉시 close (Obsidian 기본 동작)
+ */
+class PreflightWarningModal extends Modal {
+    private prefix: string;
+    private detail: string;
+    private autoCloseTimer: number | null = null;
+
+    constructor(app: ObsidianGit["app"], prefix: string, detail: string) {
+        super(app);
+        this.prefix = prefix;
+        this.detail = detail;
+    }
+
+    onOpen(): void {
+        const { contentEl, titleEl } = this;
+        titleEl.setText(this.prefix);
+        contentEl.empty();
+        contentEl.createEl("p", { text: this.detail });
+        contentEl.createEl("p", {
+            text: "auto-commit 사이클이 스킵되었습니다. 즉시 이한덕에게 문의하세요.",
+        });
+        contentEl.createEl("p", {
+            text: "auto-pull은 영향 없이 정상 동작합니다. 정리 전까지 10분마다 이 알림이 반복됩니다.",
+            attr: {
+                style: "color: var(--text-muted); font-size: 0.85em;",
+            },
+        });
+        // 확인 버튼 없음 — 10초 후 자동 닫힘
+        this.autoCloseTimer = window.setTimeout(() => {
+            this.close();
+        }, MODAL_AUTO_CLOSE_MS);
+    }
+
+    onClose(): void {
+        if (this.autoCloseTimer !== null) {
+            window.clearTimeout(this.autoCloseTimer);
+            this.autoCloseTimer = null;
+        }
+        this.contentEl.empty();
+    }
+}
 
 export default class ObsidianGit extends Plugin {
     gitManager: GitManager;
@@ -798,6 +887,146 @@ export default class ObsidianGit extends Plugin {
     }): Promise<void> {
         if (!(await this.isAllInitialized())) return;
 
+        const isDesktop = this.gitManager instanceof SimpleGit;
+
+        // =====================================================================
+        // 03번 stash 기반 로직 + 05번 Phase 0/0.5 사전검사
+        // (데스크톱 + pullBeforePush에서만 적용)
+        // =====================================================================
+        if (this.settings.pullBeforePush && isDesktop) {
+            const gm = this.gitManager as SimpleGit;
+
+            // ===== Phase 0: Pre-flight checks =====
+            const danger = await this._preflightCheck();
+            if (danger) {
+                await this._emitPreflightAlert(danger);
+                this.setPluginState({ gitAction: CurrentGitAction.idle });
+                return;
+            }
+
+            // ===== Phase 0.5: stash push 직전 race 재검 (5-1 보강) =====
+            try {
+                const recheck = await gm.git.status();
+                const recheckDeleted = recheck?.deleted?.length ?? 0;
+                if (recheckDeleted >= MASS_DELETE_THRESHOLD) {
+                    await this._emitPreflightAlert({
+                        prefix: `🚨 Mass-delete detected (${recheckDeleted} files)`,
+                        detail: "stash push 직전 재검에서 대량 삭제 감지 (race 보강)",
+                    });
+                    this.setPluginState({
+                        gitAction: CurrentGitAction.idle,
+                    });
+                    return;
+                }
+            } catch (_e) {
+                // status 실패 시 보수적으로 통과 (사고는 안 막지만 정상 동작 차단도 안 함)
+            }
+
+            // ===== Phase 1: stash push -u -m (autostash 식별 메시지) =====
+            const userName =
+                (await this.gitManager.getConfig("user.name")) || "unknown";
+            const stashMsg = `${OBSIDIAN_GIT_AUTOSTASH_TAG} ${new Date().toISOString()} ${userName}`;
+            let stashed = false;
+            try {
+                await gm.git.stash(["push", "-u", "-m", stashMsg]);
+                stashed = true;
+            } catch (e) {
+                const msg = (e as Error)?.message ?? "";
+                if (!msg.includes("No local changes")) {
+                    this.displayError(e as Error);
+                    this.setPluginState({
+                        gitAction: CurrentGitAction.idle,
+                    });
+                    return;
+                }
+                // "No local changes to save"만 무시
+            }
+
+            // ===== Phase 2: pull =====
+            let pullOk = true;
+            try {
+                await this.pull();
+            } catch (e) {
+                pullOk = false;
+                this.displayError(e as Error);
+            }
+
+            // pull 실패 시: stash 복원 시도 후 중단
+            if (!pullOk) {
+                if (stashed) {
+                    try {
+                        await gm.git.stash(["pop"]);
+                    } catch (_e) {
+                        // best-effort; 잔존 stash는 다음 사이클 검사 1-A가 잡음
+                    }
+                }
+                this.setPluginState({ gitAction: CurrentGitAction.idle });
+                return;
+            }
+
+            // ===== Phase 3: stash pop (성공 시 git이 자동 drop) =====
+            if (stashed) {
+                try {
+                    await gm.git.stash(["pop"]);
+                } catch (e) {
+                    // stash pop conflict → stash는 잔존 (자동 drop 금지)
+                    // 다음 사이클 _preflightCheck 검사 1-A가 Autostash unresolved로 감지
+                    try {
+                        const status = await gm.git.status();
+                        const conflicted = status.conflicted || [];
+                        if (conflicted.length > 0) {
+                            await this.handleConflict(conflicted);
+                        } else {
+                            this.displayError(
+                                new Error(
+                                    `Stash pop failed: ${(e as Error).message}`
+                                )
+                            );
+                        }
+                    } catch (_statusErr) {
+                        this.displayError(
+                            new Error(
+                                `Stash pop failed: ${(e as Error).message}`
+                            )
+                        );
+                    }
+                    this.setPluginState({
+                        gitAction: CurrentGitAction.idle,
+                    });
+                    return;
+                }
+            }
+
+            // ===== Phase 4: commit =====
+            const commitSuccessful = await this.commit({
+                fromAuto: fromAutoBackup,
+                requestCustomMessage,
+                commitMessage,
+                onlyStaged,
+            });
+            if (!commitSuccessful) {
+                this.setPluginState({ gitAction: CurrentGitAction.idle });
+                return;
+            }
+
+            // ===== Phase 5: push =====
+            if (!this.settings.disablePush) {
+                if (
+                    (await this.remotesAreSet()) &&
+                    (await this.gitManager.canPush())
+                ) {
+                    await this.push();
+                } else {
+                    this.displayMessage("No commits to push");
+                }
+            }
+            this.setPluginState({ gitAction: CurrentGitAction.idle });
+            return;
+        }
+
+        // =====================================================================
+        // 모바일 (isomorphic-git) 또는 pullBeforePush off: 기존 upstream 로직
+        // =====================================================================
         if (
             this.settings.syncMethod == "reset" &&
             this.settings.pullBeforePush
@@ -834,6 +1063,153 @@ export default class ObsidianGit extends Plugin {
             }
         }
         this.setPluginState({ gitAction: CurrentGitAction.idle });
+    }
+
+    // =========================================================================
+    // 05번 §5: Pre-flight check helper (Phase 0)
+    // =========================================================================
+
+    /**
+     * commitAndSync 진입 직후 실행되는 사전검사.
+     * - 검사 1-A: autostash 잔존 (pop conflict 후)
+     * - 검사 1-B: 사용자 stash 잔존
+     * - 검사 1-mix: 혼재
+     * - 검사 2: rebase/merge/cherry-pick 중단
+     * - 검사 3: 대량 삭제 (30개 이상)
+     *
+     * 데스크톱 SimpleGit 경로 전용. 모바일은 호출되지 않음.
+     */
+    async _preflightCheck(): Promise<PreflightDanger | null> {
+        if (!(this.gitManager instanceof SimpleGit)) return null;
+        const gm = this.gitManager;
+
+        // ===== 검사 1: stash list 잔존 (1-A / 1-B / 1-mix) =====
+        try {
+            const stashList: unknown = await gm.git.stash(["list"]);
+            // SimpleGit 반환 포맷: string 또는 {all, latest, total}.
+            // all[i]는 string 또는 {hash, date, message, diff?} 객체일 수 있음.
+            let lines: string[] = [];
+            if (typeof stashList === "string") {
+                lines = stashList
+                    .split("\n")
+                    .filter((l) => l.trim().length > 0);
+            } else if (
+                stashList &&
+                typeof stashList === "object" &&
+                Array.isArray((stashList as { all?: unknown[] }).all)
+            ) {
+                const all = (stashList as { all: unknown[] }).all;
+                lines = all
+                    .map((item) => {
+                        if (typeof item === "string") return item;
+                        if (item && typeof item === "object") {
+                            const rec = item as { message?: string };
+                            return rec.message ?? "";
+                        }
+                        return "";
+                    })
+                    .filter((s) => s.length > 0);
+            }
+            const autoLines = lines.filter((l) =>
+                l.includes(OBSIDIAN_GIT_AUTOSTASH_TAG)
+            );
+            const userLines = lines.filter(
+                (l) => !l.includes(OBSIDIAN_GIT_AUTOSTASH_TAG)
+            );
+            if (autoLines.length > 0 && userLines.length > 0) {
+                return {
+                    prefix: "⚠️ Stash unresolved (mixed)",
+                    detail: `autostash ${autoLines.length}개 + 사용자 stash ${userLines.length}개 혼재`,
+                };
+            }
+            if (autoLines.length > 0) {
+                return {
+                    prefix: "⚠️ Autostash unresolved",
+                    detail: `이전 사이클 stash pop 충돌로 autostash ${autoLines.length}개 잔존 (이전 Captain Hook 충돌 알림의 후속 — 동일 사고)`,
+                };
+            }
+            if (userLines.length > 0) {
+                return {
+                    prefix: "⚠️ Pre-stash detected",
+                    detail: `git stash list에 사용자 stash ${userLines.length}개 발견`,
+                };
+            }
+        } catch (_e) {
+            // stash 명령 자체가 실패하면 보수적으로 통과
+        }
+
+        // ===== 검사 2: rebase/merge/cherry-pick 중단 =====
+        const adapter = this.app.vault.adapter;
+        const midStateFiles = [
+            ".git/MERGE_HEAD",
+            ".git/REBASE_HEAD",
+            ".git/CHERRY_PICK_HEAD",
+            ".git/rebase-merge",
+            ".git/rebase-apply",
+        ];
+        for (const f of midStateFiles) {
+            try {
+                if (await adapter.exists(f)) {
+                    return {
+                        prefix: "⚠️ Mid-rebase detected",
+                        detail: `${f} 파일 잔존 — rebase/merge/cherry-pick 중단 상태`,
+                    };
+                }
+            } catch (_e) {
+                // adapter 에러는 무시
+            }
+        }
+
+        // ===== 검사 3: 대량 삭제 감지 =====
+        try {
+            const status = await gm.git.status();
+            const deletedCount = status?.deleted?.length ?? 0;
+            if (deletedCount >= MASS_DELETE_THRESHOLD) {
+                return {
+                    prefix: `🚨 Mass-delete detected (${deletedCount} files)`,
+                    detail: `삭제 파일 ${deletedCount}건 감지 (auto-commit 진입 시점)`,
+                };
+            }
+        } catch (_e) {
+            // status 실패는 보수적으로 통과
+        }
+
+        return null;
+    }
+
+    /**
+     * 사전검사 위험 감지 시 디스코드 + Obsidian Modal 동시 발사.
+     * - de-dup 없음 (사용자 결정: 10분마다 반복 알림)
+     * - 둘 다 실패해도 사이클 스킵 로직은 영향 없음
+     */
+    async _emitPreflightAlert(danger: PreflightDanger): Promise<void> {
+        const userName =
+            (await this.gitManager.getConfig("user.name")) || "unknown";
+
+        // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
+        try {
+            await requestUrl({
+                url: CAPTAIN_HOOK_WEBHOOK_URL,
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    content: `<@${CAPTAIN_HOOK_MENTION_ID}> **${danger.prefix}**\n사용자: ${userName}\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
+                }),
+            });
+        } catch (_e) {
+            // 네트워크 차단 등 — 사이클 차단까진 안 하도록 무시
+        }
+
+        // (2) Obsidian Modal 팝업 (확인 버튼 없음, 10초 자동 닫힘)
+        try {
+            new PreflightWarningModal(
+                this.app,
+                danger.prefix,
+                danger.detail
+            ).open();
+        } catch (_e) {
+            // Modal 생성 실패도 무시
+        }
     }
 
     // Returns true if commit was successfully
@@ -1417,6 +1793,30 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
             ];
         }
         await this.tools.writeAndOpenFile(lines?.join("\n"));
+
+        // =====================================================================
+        // Captain Hook 디스코드 알림 + 05번 연결고리 문구
+        // 동일 webhook 재사용. 충돌 발생 시 본인(이한덕)에게 즉시 멘션.
+        // 05번: "stash 잔존 - 다음 사이클부터 Autostash unresolved 반복" 예고
+        // =====================================================================
+        try {
+            const userName =
+                (await this.gitManager.getConfig("user.name")) || "unknown";
+            const conflictList = (conflicted ?? []).join(", ");
+            const content =
+                `<@${CAPTAIN_HOOK_MENTION_ID}> **⚠️ Vault Git 충돌 발생!**\n` +
+                `사용자: ${userName}\n` +
+                `충돌 파일: ${conflictList}\n` +
+                `⚠️ stash 잔존 상태 — 다음 사이클부터 "Autostash unresolved" 알림이 10분마다 반복됩니다. 정리까지 이한덕에게 문의하세요.`;
+            await requestUrl({
+                url: CAPTAIN_HOOK_WEBHOOK_URL,
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ content }),
+            });
+        } catch (_discordErr) {
+            // Discord 알림 실패는 무시 (핵심 동작 아님)
+        }
     }
 
     async editRemotes(): Promise<string | undefined> {

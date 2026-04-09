@@ -21,6 +21,7 @@ const context = await esbuild.context({
         "obsidian",
         "electron",
         "child_process",
+        "crypto",
         "fs",
         "os",
         "path",
