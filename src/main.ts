@@ -78,15 +78,30 @@ import { EditorIntegration } from "./editor/editorIntegration";
 const OBSIDIAN_GIT_AUTOSTASH_TAG = "obsidian-git autostash";
 
 /**
- * Captain Hook 디스코드 webhook URL. 충돌/사전검사 알림 모두 동일 채널 사용.
+ * Captain Hook 알림 설정은 **각 PC의 localStorage에서 읽는다**.
+ * 코드/저장소에 webhook URL이나 멘션 ID를 절대 하드코딩하지 않는다 (Codex P1).
+ *
+ * 설정 방법 (Obsidian devtools console — Cmd+Option+I):
+ *   app.saveLocalStorage("obsidian-git:captainHookWebhookUrl", "https://discord.com/api/webhooks/...")
+ *   app.saveLocalStorage("obsidian-git:captainHookMentionId", "1480357717288681473")
+ *
+ * webhook URL이 설정되지 않은 PC에서는 디스코드 알림이 silent skip된다.
+ * (Modal 알림은 그대로 발사 — UI 인지 누락 없음)
  */
-const CAPTAIN_HOOK_WEBHOOK_URL =
-    "https://discord.com/api/webhooks/1489414668861706250/NAmGdTejGlkCW_oitzN39gWZ1uKJdfWC3ntdz5kDcrNGf1hy_brI6bWFYP9xX_hx93HP";
-
-/**
- * 이한덕 Discord 멘션 ID (Captain Hook 알림 수신자).
- */
-const CAPTAIN_HOOK_MENTION_ID = "1480357717288681473";
+function getCaptainHookConfig(
+    app: ObsidianGit["app"]
+): { webhookUrl: string | null; mentionId: string | null } {
+    return {
+        webhookUrl:
+            (app.loadLocalStorage(
+                "obsidian-git:captainHookWebhookUrl"
+            ) as string | null) ?? null,
+        mentionId:
+            (app.loadLocalStorage(
+                "obsidian-git:captainHookMentionId"
+            ) as string | null) ?? null,
+    };
+}
 
 /**
  * mass-delete 임계치. Phase 0과 Phase 0.5에서 동일 값 사용.
@@ -943,9 +958,14 @@ export default class ObsidianGit extends Plugin {
             }
 
             // ===== Phase 2: pull =====
+            // Codex P1-1: this.pull()은 실패 시 false를 반환하지 throw하지 않음.
+            // 기존 try/catch만으로는 pull 실패 분기가 dead branch였음.
             let pullOk = true;
             try {
-                await this.pull();
+                const pullResult = await this.pull();
+                if (pullResult === false) {
+                    pullOk = false;
+                }
             } catch (e) {
                 pullOk = false;
                 this.displayError(e as Error);
@@ -971,11 +991,13 @@ export default class ObsidianGit extends Plugin {
                 } catch (e) {
                     // stash pop conflict → stash는 잔존 (자동 drop 금지)
                     // 다음 사이클 _preflightCheck 검사 1-A가 Autostash unresolved로 감지
+                    // Codex P2: fromStashPop=true 전달하여 handleConflict 알림에
+                    // "Autostash unresolved 반복" 연결고리 문구가 부가되도록 함
                     try {
                         const status = await gm.git.status();
                         const conflicted = status.conflicted || [];
                         if (conflicted.length > 0) {
-                            await this.handleConflict(conflicted);
+                            await this.handleConflict(conflicted, true);
                         } else {
                             this.displayError(
                                 new Error(
@@ -1139,25 +1161,58 @@ export default class ObsidianGit extends Plugin {
         }
 
         // ===== 검사 2: rebase/merge/cherry-pick 중단 =====
-        const adapter = this.app.vault.adapter;
-        const midStateFiles = [
-            ".git/MERGE_HEAD",
-            ".git/REBASE_HEAD",
-            ".git/CHERRY_PICK_HEAD",
-            ".git/rebase-merge",
-            ".git/rebase-apply",
+        // Codex P1-2: vault root 기준 .git/* 파일 직접 검사는 basePath/gitDir 설정과
+        // 충돌하여 false negative를 일으킴. 대신 simple-git의 revparse --verify로
+        // git이 인식하는 ref 경로를 사용한다 (gitDir 설정 자동 반영).
+        const midStateRefs: { ref: string; type: string }[] = [
+            { ref: "MERGE_HEAD", type: "merge" },
+            { ref: "REBASE_HEAD", type: "rebase" },
+            { ref: "CHERRY_PICK_HEAD", type: "cherry-pick" },
+            { ref: "REVERT_HEAD", type: "revert" },
         ];
-        for (const f of midStateFiles) {
+        for (const r of midStateRefs) {
             try {
-                if (await adapter.exists(f)) {
+                const out = await gm.git.revparse([
+                    "--verify",
+                    "--quiet",
+                    r.ref,
+                ]);
+                if (out && out.trim().length > 0) {
                     return {
                         prefix: "⚠️ Mid-rebase detected",
-                        detail: `${f} 파일 잔존 — rebase/merge/cherry-pick 중단 상태`,
+                        detail: `${r.ref} 잔존 — ${r.type} 중단 상태`,
                     };
                 }
             } catch (_e) {
-                // adapter 에러는 무시
+                // ref가 존재하지 않으면 throw → 정상
             }
+        }
+        // 인터랙티브 rebase는 별도 디렉토리(rebase-merge/, rebase-apply/) 사용.
+        // git rev-parse --git-path로 경로 조회 후 fs.exists 체크 (basePath 안전)
+        try {
+            const gitDirPath = (
+                await gm.git.revparse(["--git-path", "rebase-merge"])
+            ).trim();
+            if (gitDirPath) {
+                // adapter는 vault 루트 기준이라 절대 경로면 작동 안 함.
+                // simple-git이 절대 경로를 반환할 수 있으므로 raw command로 head-name 시도
+                try {
+                    await gm.git.raw([
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "rebase-merge/head-name",
+                    ]);
+                    return {
+                        prefix: "⚠️ Mid-rebase detected",
+                        detail: "rebase-merge 진행 중 — 인터랙티브 rebase 중단 상태",
+                    };
+                } catch (_e) {
+                    // 없음
+                }
+            }
+        } catch (_e) {
+            // best-effort
         }
 
         // ===== 검사 3: 대량 삭제 감지 =====
@@ -1187,18 +1242,24 @@ export default class ObsidianGit extends Plugin {
             (await this.gitManager.getConfig("user.name")) || "unknown";
 
         // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
-        try {
-            await requestUrl({
-                url: CAPTAIN_HOOK_WEBHOOK_URL,
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    content: `<@${CAPTAIN_HOOK_MENTION_ID}> **${danger.prefix}**\n사용자: ${userName}\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
-                }),
-            });
-        } catch (_e) {
-            // 네트워크 차단 등 — 사이클 차단까진 안 하도록 무시
+        // webhook URL은 localStorage에서 읽음 (Codex P1-3: 코드 하드코딩 금지)
+        const { webhookUrl, mentionId } = getCaptainHookConfig(this.app);
+        if (webhookUrl) {
+            try {
+                const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
+                await requestUrl({
+                    url: webhookUrl,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName}\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
+                    }),
+                });
+            } catch (_e) {
+                // 네트워크 차단 등 — 사이클 차단까진 안 하도록 무시
+            }
         }
+        // webhook URL이 설정되지 않은 PC: 디스코드 silent skip, Modal은 그대로 발사
 
         // (2) Obsidian Modal 팝업 (확인 버튼 없음, 10초 자동 닫힘)
         try {
@@ -1757,7 +1818,10 @@ export default class ObsidianGit extends Plugin {
         return result;
     }
 
-    async handleConflict(conflicted?: string[]): Promise<void> {
+    async handleConflict(
+        conflicted?: string[],
+        fromStashPop: boolean = false
+    ): Promise<void> {
         this.localStorage.setConflict(true);
         let lines: string[] | undefined;
         if (conflicted !== undefined) {
@@ -1795,28 +1859,40 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
         await this.tools.writeAndOpenFile(lines?.join("\n"));
 
         // =====================================================================
-        // Captain Hook 디스코드 알림 + 05번 연결고리 문구
-        // 동일 webhook 재사용. 충돌 발생 시 본인(이한덕)에게 즉시 멘션.
-        // 05번: "stash 잔존 - 다음 사이클부터 Autostash unresolved 반복" 예고
+        // Captain Hook 디스코드 알림
+        // - webhook URL은 localStorage에서 읽음 (Codex P1-3: 코드 하드코딩 금지)
+        // - 05번 연결고리 문구는 stash pop 충돌일 때만 부가 (Codex P2)
+        //   handleConflict는 일반 commit/pull/merge 충돌에서도 호출되는데,
+        //   stash와 무관한 충돌에 "Autostash unresolved 반복" 안내가 잘못 나가지 않도록
+        //   호출자가 fromStashPop=true를 명시할 때만 chain warning 추가
         // =====================================================================
-        try {
-            const userName =
-                (await this.gitManager.getConfig("user.name")) || "unknown";
-            const conflictList = (conflicted ?? []).join(", ");
-            const content =
-                `<@${CAPTAIN_HOOK_MENTION_ID}> **⚠️ Vault Git 충돌 발생!**\n` +
-                `사용자: ${userName}\n` +
-                `충돌 파일: ${conflictList}\n` +
-                `⚠️ stash 잔존 상태 — 다음 사이클부터 "Autostash unresolved" 알림이 10분마다 반복됩니다. 정리까지 이한덕에게 문의하세요.`;
-            await requestUrl({
-                url: CAPTAIN_HOOK_WEBHOOK_URL,
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ content }),
-            });
-        } catch (_discordErr) {
-            // Discord 알림 실패는 무시 (핵심 동작 아님)
+        const { webhookUrl, mentionId } = getCaptainHookConfig(this.app);
+        if (webhookUrl) {
+            try {
+                const userName =
+                    (await this.gitManager.getConfig("user.name")) ||
+                    "unknown";
+                const conflictList = (conflicted ?? []).join(", ");
+                const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
+                const chainWarning = fromStashPop
+                    ? `\n⚠️ stash 잔존 상태 — 다음 사이클부터 "Autostash unresolved" 알림이 10분마다 반복됩니다. 정리까지 이한덕에게 문의하세요.`
+                    : "";
+                const content =
+                    `${mentionPrefix}**⚠️ Vault Git 충돌 발생!**\n` +
+                    `사용자: ${userName}\n` +
+                    `충돌 파일: ${conflictList}` +
+                    chainWarning;
+                await requestUrl({
+                    url: webhookUrl,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ content }),
+                });
+            } catch (_discordErr) {
+                // Discord 알림 실패는 무시 (핵심 동작 아님)
+            }
         }
+        // webhook URL이 설정되지 않은 PC: 디스코드 silent skip
     }
 
     async editRemotes(): Promise<string | undefined> {
