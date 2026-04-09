@@ -1187,28 +1187,27 @@ export default class ObsidianGit extends Plugin {
                 // ref가 존재하지 않으면 throw → 정상
             }
         }
-        // 인터랙티브 rebase는 별도 디렉토리(rebase-merge/, rebase-apply/) 사용.
-        // git rev-parse --git-path로 경로 조회 후 fs.exists 체크 (basePath 안전)
+        // 인터랙티브 rebase는 ref가 아니라 별도 디렉토리(rebase-merge/)에 상태를 둔다.
+        // paused 상태(edit/break 등)에서는 REBASE_HEAD가 비어 있어도 디렉토리는 남는다.
         try {
-            const gitDirPath = (
+            const rebaseMergePath = (
                 await gm.git.revparse(["--git-path", "rebase-merge"])
             ).trim();
-            if (gitDirPath) {
-                // adapter는 vault 루트 기준이라 절대 경로면 작동 안 함.
-                // simple-git이 절대 경로를 반환할 수 있으므로 raw command로 head-name 시도
-                try {
-                    await gm.git.raw([
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "rebase-merge/head-name",
-                    ]);
+            if (rebaseMergePath) {
+                const adapter = this.app.vault.adapter as FileSystemAdapter;
+                const vaultRelativePath = path.isAbsolute(rebaseMergePath)
+                    ? normalizePath(
+                          path.relative(
+                              adapter.getBasePath(),
+                              rebaseMergePath
+                          )
+                      )
+                    : gm.getRelativeVaultPath(rebaseMergePath);
+                if (await adapter.exists(vaultRelativePath)) {
                     return {
                         prefix: "⚠️ Mid-rebase detected",
-                        detail: "rebase-merge 진행 중 — 인터랙티브 rebase 중단 상태",
+                        detail: "rebase-merge 디렉터리 잔존 — 인터랙티브 rebase 중단 상태",
                     };
-                } catch (_e) {
-                    // 없음
                 }
             }
         } catch (_e) {
