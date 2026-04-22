@@ -71,6 +71,17 @@ export interface ObsidianGitSettings {
         showSigns: boolean;
         statusBar: "disabled" | "colored" | "monochrome";
     };
+    /**
+     * Captain Hook 디스코드 웹훅 URL (data.json 경유 — git으로 팀 전파).
+     * 비어 있으면 localStorage 폴백(`obsidian-git:captainHookWebhookUrl`)을 읽는다.
+     * 둘 다 비어 있으면 Discord 알림 silent skip, Modal은 정상 발사.
+     */
+    captainHookWebhookUrl?: string;
+    /**
+     * Captain Hook 디스코드 멘션 ID (data.json 경유).
+     * 비어 있으면 localStorage 폴백(`obsidian-git:captainHookMentionId`).
+     */
+    captainHookMentionId?: string;
 }
 
 /**

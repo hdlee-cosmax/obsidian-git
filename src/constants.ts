@@ -50,6 +50,8 @@ export const DEFAULT_SETTINGS: ObsidianGitSettings = {
         hunkCommands: false,
         statusBar: "disabled",
     },
+    captainHookWebhookUrl: "",
+    captainHookMentionId: "",
     lineAuthor: {
         show: false,
         followMovement: "inactive",

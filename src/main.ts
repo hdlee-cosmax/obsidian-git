@@ -78,28 +78,41 @@ import { EditorIntegration } from "./editor/editorIntegration";
 const OBSIDIAN_GIT_AUTOSTASH_TAG = "obsidian-git autostash";
 
 /**
- * Captain Hook 알림 설정은 **각 PC의 localStorage에서 읽는다**.
- * 코드/저장소에 webhook URL이나 멘션 ID를 절대 하드코딩하지 않는다 (Codex P1).
+ * Captain Hook 알림 설정은 **data.json 우선, localStorage 폴백** 순서로 읽는다.
  *
- * 설정 방법 (Obsidian devtools console — Cmd+Option+I):
- *   app.saveLocalStorage("obsidian-git:captainHookWebhookUrl", "https://discord.com/api/webhooks/...")
- *   app.saveLocalStorage("obsidian-git:captainHookMentionId", "1480357717288681473")
+ * - data.json (`captainHookWebhookUrl`, `captainHookMentionId`): git 추적 → 팀 전체 전파.
+ *   2026-04-22 Option-1 배포. 20명 PC에 동일 webhook이 자동 배포되도록 함.
+ * - localStorage (`obsidian-git:captainHookWebhookUrl` 등): PC별 개별 설정.
+ *   이전(9d19554) 호환을 위해 폴백으로 유지. data.json이 비어 있을 때만 사용.
  *
- * webhook URL이 설정되지 않은 PC에서는 디스코드 알림이 silent skip된다.
- * (Modal 알림은 그대로 발사 — UI 인지 누락 없음)
+ * 둘 다 비어 있으면 Discord 알림 silent skip, Modal 알림은 그대로 발사.
+ *
+ * data.json 수정 방법 (추천):
+ *   .obsidian/plugins/obsidian-git/data.json 파일에 아래 2개 키 추가:
+ *     "captainHookWebhookUrl": "https://discord.com/api/webhooks/..."
+ *     "captainHookMentionId": "1480357717288681473"
+ *
+ * localStorage 폴백 방법 (devtools console):
+ *   app.saveLocalStorage("obsidian-git:captainHookWebhookUrl", "...")
+ *   app.saveLocalStorage("obsidian-git:captainHookMentionId", "...")
  */
-function getCaptainHookConfig(
-    app: ObsidianGit["app"]
-): { webhookUrl: string | null; mentionId: string | null } {
+function getCaptainHookConfig(plugin: {
+    app: ObsidianGit["app"];
+    settings: ObsidianGit["settings"];
+}): { webhookUrl: string | null; mentionId: string | null } {
+    const settingsUrl = plugin.settings.captainHookWebhookUrl?.trim() || null;
+    const settingsMention = plugin.settings.captainHookMentionId?.trim() || null;
+    const lsUrl =
+        plugin.app.loadLocalStorage(
+            "obsidian-git:captainHookWebhookUrl"
+        ) ?? null;
+    const lsMention =
+        plugin.app.loadLocalStorage(
+            "obsidian-git:captainHookMentionId"
+        ) ?? null;
     return {
-        webhookUrl:
-            (app.loadLocalStorage(
-                "obsidian-git:captainHookWebhookUrl"
-            ) as string | null) ?? null,
-        mentionId:
-            (app.loadLocalStorage(
-                "obsidian-git:captainHookMentionId"
-            ) as string | null) ?? null,
+        webhookUrl: settingsUrl || lsUrl,
+        mentionId: settingsMention || lsMention,
     };
 }
 
@@ -1241,8 +1254,8 @@ export default class ObsidianGit extends Plugin {
             (await this.gitManager.getConfig("user.name")) || "unknown";
 
         // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
-        // webhook URL은 localStorage에서 읽음 (Codex P1-3: 코드 하드코딩 금지)
-        const { webhookUrl, mentionId } = getCaptainHookConfig(this.app);
+        // webhook URL은 data.json 우선, localStorage 폴백 (2026-04-22 Option-1)
+        const { webhookUrl, mentionId } = getCaptainHookConfig(this);
         if (webhookUrl) {
             try {
                 const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
@@ -1859,13 +1872,13 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
 
         // =====================================================================
         // Captain Hook 디스코드 알림
-        // - webhook URL은 localStorage에서 읽음 (Codex P1-3: 코드 하드코딩 금지)
+        // - webhook URL: data.json 우선, localStorage 폴백 (2026-04-22 Option-1)
         // - 05번 연결고리 문구는 stash pop 충돌일 때만 부가 (Codex P2)
         //   handleConflict는 일반 commit/pull/merge 충돌에서도 호출되는데,
         //   stash와 무관한 충돌에 "Autostash unresolved 반복" 안내가 잘못 나가지 않도록
         //   호출자가 fromStashPop=true를 명시할 때만 chain warning 추가
         // =====================================================================
-        const { webhookUrl, mentionId } = getCaptainHookConfig(this.app);
+        const { webhookUrl, mentionId } = getCaptainHookConfig(this);
         if (webhookUrl) {
             try {
                 const userName =
