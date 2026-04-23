@@ -25,8 +25,11 @@ import { addCommmands } from "./commands";
 import {
     CONFLICT_OUTPUT_FILE,
     DEFAULT_SETTINGS,
+    DEPLOYER_EMAIL,
     DIFF_VIEW_CONFIG,
     HISTORY_VIEW_CONFIG,
+    PLUGIN_BLOCK_RATE_LIMIT_MS,
+    PLUGIN_PATH_PREFIX,
     SOURCE_CONTROL_VIEW_CONFIG,
     SPLIT_DIFF_VIEW_CONFIG,
 } from "./constants";
@@ -924,6 +927,41 @@ export default class ObsidianGit extends Plugin {
         if (this.settings.pullBeforePush && isDesktop) {
             const gm = this.gitManager as SimpleGit;
 
+            // ===== Option F Entry-Point Guard — deploy-only plugin path enforcement =====
+            // onlyStaged=true 분기 커버 + 알림 발사. onlyStaged=false 분기에서는
+            // commitAll의 add -A가 뒤에 있어 여기 reset은 효과 제한적 → simpleGit.ts 내
+            // primary guard가 실효 차단 담당. 본 guard는 보조.
+            try {
+                const userEmail = await gm.getConfig("user.email", "all");
+                if (userEmail !== DEPLOYER_EMAIL) {
+                    const statusPre = await gm.git.status();
+                    const pluginFiles = (statusPre.files ?? [])
+                        .map((f) => f.path)
+                        .filter((p) => p.startsWith(PLUGIN_PATH_PREFIX));
+                    if (pluginFiles.length > 0) {
+                        try {
+                            await gm.git.reset([
+                                "HEAD",
+                                "--",
+                                ...pluginFiles,
+                            ]);
+                        } catch (_e) {
+                            // reset 실패해도 primary guard가 fallback
+                        }
+                        await this._emitPluginBlockedAlert({
+                            userEmail: userEmail || "(unset)",
+                            paths: pluginFiles,
+                        });
+                    }
+                }
+            } catch (e) {
+                // fail-open: guard 자체 에러로 sync halt 금지 (sentinel이 reactive backstop)
+                console.error(
+                    "[obsidian-git] plugin-path entry-guard error:",
+                    e
+                );
+            }
+
             // ===== Phase 0: Pre-flight checks =====
             const danger = await this._preflightCheck();
             if (danger) {
@@ -1282,6 +1320,62 @@ export default class ObsidianGit extends Plugin {
             ).open();
         } catch (_e) {
             // Modal 생성 실패도 무시
+        }
+    }
+
+    /**
+     * Option F: plugin-path-guard 알림. Discord (외부 인지) + Notice (사고 PC 본인 인지).
+     * Rate-limit 1시간 — 05번 §3 "de-dup 없음" 과 차별화 (Fix 4).
+     * plugin-block-guard는 sync-halting 아니고 팀원 actionable 아니며 데이터 손실 없음.
+     * 호출부: simpleGit.ts commitAll() primary guard, main.ts commitAndSync entry-point guard.
+     */
+    _pluginBlockAlertLastFired = 0;
+    async _emitPluginBlockedAlert(args: {
+        userEmail: string;
+        paths: string[];
+    }): Promise<void> {
+        const now = Date.now();
+        if (
+            now - this._pluginBlockAlertLastFired <
+            PLUGIN_BLOCK_RATE_LIMIT_MS
+        ) {
+            return;
+        }
+        this._pluginBlockAlertLastFired = now;
+
+        const userName =
+            (await this.gitManager.getConfig("user.name", "all")) || "unknown";
+        const fileList = args.paths.join("\n  - ");
+
+        const { webhookUrl, mentionId } = getCaptainHookConfig(this);
+        if (webhookUrl) {
+            try {
+                const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
+                await requestUrl({
+                    url: webhookUrl,
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        content:
+                            `${mentionPrefix}**🛡️ Plugin path staging blocked**\n` +
+                            `사용자: ${userName} (${args.userEmail})\n` +
+                            `차단 파일:\n  - ${fileList}\n` +
+                            `→ 배포는 이한덕 전담. 이 PC에서 plugin 파일 push 시도는 자동 차단됨.\n` +
+                            `(1시간 rate-limit — 동일 PC 반복 알림 억제)`,
+                    }),
+                });
+            } catch (_e) {
+                // 네트워크 차단 등 무시 (fail-open)
+            }
+        }
+
+        try {
+            new Notice(
+                `[obsidian-git] plugin 경로 staging 차단 (${args.paths.length}개 파일). 배포는 이한덕 통해 진행.`,
+                7000
+            );
+        } catch (_e) {
+            // Notice 실패 무시
         }
     }
 

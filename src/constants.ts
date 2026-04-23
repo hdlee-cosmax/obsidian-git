@@ -4,6 +4,21 @@ export const DATE_FORMAT = "YYYY-MM-DD";
 export const DATE_TIME_FORMAT_MINUTES = `${DATE_FORMAT} HH:mm`;
 export const DATE_TIME_FORMAT_SECONDS = `${DATE_FORMAT} HH:mm:ss`;
 
+/**
+ * Option F: Plugin-Path Guard — deploy-only model enforcement (2026-04-23).
+ * 20명이 동일 플러그인을 쓰지만 plugin 파일(main.js/data.json/manifest.json) push는
+ * 이한덕 단독. 팀원 PC 자동업데이트로 plugin이 덮어써지고 auto-commit이 그걸 push해서
+ * 전원에게 regression 전파되는 경로(4/20 e47795cb1 사고 재현)를 plugin 내부에서 차단.
+ */
+export const DEPLOYER_EMAIL = "handuk.lee@cosmax.com";
+export const PLUGIN_PATH_PREFIX = ".obsidian/plugins/obsidian-git/";
+/**
+ * Plugin-block 알림 rate-limit. 1시간.
+ * 근거: plugin-path-guard는 sync-halting 아니고, 팀원 actionable 아니고, 데이터 손실 없음.
+ *       따라서 05번 §3 preflight de-dup-none 원칙과 차별화, rate-limit 적절.
+ */
+export const PLUGIN_BLOCK_RATE_LIMIT_MS = 3600 * 1000;
+
 export const GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH = 40;
 
 export const CONFLICT_OUTPUT_FILE = "conflict-files-obsidian-git.md";

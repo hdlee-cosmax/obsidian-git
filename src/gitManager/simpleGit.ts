@@ -11,7 +11,9 @@ import {
     ASK_PASS_SCRIPT,
     ASK_PASS_SCRIPT_FILE,
     DEFAULT_WIN_GIT_PATH,
+    DEPLOYER_EMAIL,
     GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH,
+    PLUGIN_PATH_PREFIX,
 } from "src/constants";
 import type { LineAuthorFollowMovement } from "src/editor/lineAuthor/model";
 import { GeneralModal } from "src/ui/modals/generalModal";
@@ -503,6 +505,33 @@ export class SimpleGit extends GitManager {
         this.plugin.setPluginState({ gitAction: CurrentGitAction.add });
 
         await this.git.add("-A");
+
+        // ===== Option F Primary Guard — deploy-only plugin path enforcement =====
+        // commitAll은 add -A로 전체 staging하므로, 여기서 plugin 경로만 다시 unstage.
+        // commitAndSync 진입부의 entry-point guard 단독으로는 onlyStaged=false 경로에서 no-op.
+        // 본 guard가 defense-in-depth의 실효 차단 지점.
+        try {
+            const userEmail = await this.getConfig("user.email", "all");
+            if (userEmail !== DEPLOYER_EMAIL) {
+                const st = await this.git.status();
+                const pluginStaged = (st.staged ?? []).filter((p) =>
+                    p.startsWith(PLUGIN_PATH_PREFIX)
+                );
+                if (pluginStaged.length > 0) {
+                    await this.git.reset(["HEAD", "--", ...pluginStaged]);
+                    await this.plugin._emitPluginBlockedAlert({
+                        userEmail: userEmail || "(unset)",
+                        paths: pluginStaged,
+                    });
+                }
+            }
+        } catch (e) {
+            // fail-open: guard 에러 시 sync 계속 (sentinel이 reactive backstop)
+            console.error(
+                "[obsidian-git] plugin-path primary-guard error:",
+                e
+            );
+        }
 
         this.plugin.setPluginState({ gitAction: CurrentGitAction.commit });
 
