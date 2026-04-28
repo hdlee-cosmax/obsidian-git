@@ -1290,6 +1290,8 @@ export default class ObsidianGit extends Plugin {
     async _emitPreflightAlert(danger: PreflightDanger): Promise<void> {
         const userName =
             (await this.gitManager.getConfig("user.name")) || "unknown";
+        const userEmail =
+            (await this.gitManager.getConfig("user.email")) || "unknown";
 
         // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
         // webhook URL은 data.json 우선, localStorage 폴백 (2026-04-22 Option-1)
@@ -1302,7 +1304,7 @@ export default class ObsidianGit extends Plugin {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName}\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
+                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName} (${userEmail})\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
                     }),
                 });
             } catch (_e) {
@@ -1978,6 +1980,9 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
                 const userName =
                     (await this.gitManager.getConfig("user.name")) ||
                     "unknown";
+                const userEmail =
+                    (await this.gitManager.getConfig("user.email")) ||
+                    "unknown";
                 const conflictList = (conflicted ?? []).join(", ");
                 const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
                 const chainWarning = fromStashPop
@@ -1985,7 +1990,7 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
                     : "";
                 const content =
                     `${mentionPrefix}**⚠️ Vault Git 충돌 발생!**\n` +
-                    `사용자: ${userName}\n` +
+                    `사용자: ${userName} (${userEmail})\n` +
                     `충돌 파일: ${conflictList}` +
                     chainWarning;
                 await requestUrl({
