@@ -15,6 +15,8 @@ import {
     moment,
 } from "obsidian";
 import * as path from "path";
+import * as fs from "fs";
+import * as os from "os";
 import { pluginRef } from "src/pluginGlobalRef";
 import { PromiseQueue } from "src/promiseQueue";
 import { ObsidianGitSettingsTab } from "src/setting/settings";
@@ -1157,6 +1159,15 @@ export default class ObsidianGit extends Plugin {
         if (!(this.gitManager instanceof SimpleGit)) return null;
         const gm = this.gitManager;
 
+        // ===== Phase 0: 자동 정리 — 빈 stash + reverse-applicable autostash drop =====
+        // 빈 patch는 autostash/사용자 stash 모두 drop. autostash 중 워킹트리에
+        // reverse-applicable(=이미 반영됨)한 entry도 drop. 알람 발사 전 cleanup.
+        try {
+            await this._autoResolveStashes(gm);
+        } catch (_e) {
+            // 자동 정리 실패는 보수적으로 무시 (기존 알람 흐름 그대로 진행)
+        }
+
         // ===== 검사 1: stash list 잔존 (1-A / 1-B / 1-mix) =====
         try {
             const stashList: unknown = await gm.git.stash(["list"]);
@@ -1324,6 +1335,122 @@ export default class ObsidianGit extends Plugin {
         } catch (_e) {
             // Modal 생성 실패도 무시
         }
+    }
+
+    /**
+     * 사전검사 Phase 0: 알람 발사 전 자동 정리 가능한 stash 제거.
+     *
+     * - 빈 patch (autostash/사용자 stash 무관): 의미 없으므로 drop.
+     * - autostash + reverse-applicable patch: 변경분이 이미 워킹트리에 반영됐음 → drop.
+     * - 사용자 stash + 내용 있음: 의도 보존을 위해 절대 drop 금지.
+     *
+     * 큰 인덱스부터 처리한다 — drop 시 작은 인덱스 stash@{N}은 영향 없음.
+     */
+    private async _autoResolveStashes(gm: SimpleGit): Promise<void> {
+        let raw: unknown;
+        try {
+            raw = await gm.git.stash(["list"]);
+        } catch (_e) {
+            return;
+        }
+        const lines = this._parseStashLines(raw);
+        if (lines.length === 0) return;
+
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const stashRef = `stash@{${i}}`;
+            const isAuto = lines[i].includes(OBSIDIAN_GIT_AUTOSTASH_TAG);
+
+            let patch = "";
+            try {
+                const result = await gm.git.stash([
+                    "show",
+                    "-p",
+                    stashRef,
+                ]);
+                patch = typeof result === "string" ? result : "";
+            } catch (_e) {
+                continue; // patch 추출 실패 → 보수적 keep
+            }
+
+            // 1) 빈 patch — autostash/사용자 무관 즉시 drop
+            if (patch.trim() === "") {
+                try {
+                    await gm.git.stash(["drop", stashRef]);
+                } catch (_e) {
+                    /* keep on failure */
+                }
+                continue;
+            }
+
+            // 2) autostash + reverse-applicable — 이미 반영됨, drop
+            if (isAuto && (await this._isPatchReverseApplicable(gm, patch))) {
+                try {
+                    await gm.git.stash(["drop", stashRef]);
+                } catch (_e) {
+                    /* keep on failure */
+                }
+                continue;
+            }
+
+            // 3) 그 외 — 보수적 keep (검사 1에서 알람 발사)
+        }
+    }
+
+    /**
+     * patch가 현재 워킹트리에 reverse-applicable한가?
+     * temp file 저장 → `git apply --check --reverse`로 dry-run. 통과 시 이미 반영됨.
+     */
+    private async _isPatchReverseApplicable(
+        gm: SimpleGit,
+        patch: string
+    ): Promise<boolean> {
+        if (!patch || patch.trim() === "") return true;
+        const tmpFile = path.join(
+            os.tmpdir(),
+            `obsidian-git-stash-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 8)}.patch`
+        );
+        try {
+            fs.writeFileSync(tmpFile, patch, "utf8");
+            await gm.git.raw(["apply", "--check", "--reverse", tmpFile]);
+            return true;
+        } catch (_e) {
+            return false;
+        } finally {
+            try {
+                fs.unlinkSync(tmpFile);
+            } catch (_e) {
+                /* ignore */
+            }
+        }
+    }
+
+    /**
+     * `git stash list` 응답을 메시지 라인 배열로 정규화.
+     * SimpleGit 반환은 string 또는 {all, latest, total} 객체.
+     */
+    private _parseStashLines(raw: unknown): string[] {
+        if (typeof raw === "string") {
+            return raw.split("\n").filter((l) => l.trim().length > 0);
+        }
+        if (
+            raw &&
+            typeof raw === "object" &&
+            Array.isArray((raw as { all?: unknown[] }).all)
+        ) {
+            return (raw as { all: unknown[] }).all
+                .map((item) => {
+                    if (typeof item === "string") return item;
+                    if (item && typeof item === "object") {
+                        const rec = item as { message?: string };
+                        return rec.message ?? "";
+                    }
+                    return "";
+                })
+                .filter((s) => s.length > 0);
+        }
+        return [];
     }
 
     /**
