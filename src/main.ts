@@ -990,7 +990,8 @@ export default class ObsidianGit extends Plugin {
 
             // ===== Phase 1: stash push -u -m (autostash 식별 메시지) =====
             const userName =
-                (await this.gitManager.getConfig("user.name")) || "unknown";
+                (await this.gitManager.getConfig("user.name", "all")) ||
+                "unknown";
             const stashMsg = `${OBSIDIAN_GIT_AUTOSTASH_TAG} ${new Date().toISOString()} ${userName}`;
             let stashed = false;
             try {
@@ -1289,9 +1290,9 @@ export default class ObsidianGit extends Plugin {
      */
     async _emitPreflightAlert(danger: PreflightDanger): Promise<void> {
         const userName =
-            (await this.gitManager.getConfig("user.name")) || "unknown";
+            (await this.gitManager.getConfig("user.name", "all")) || "unknown";
         const userEmail =
-            (await this.gitManager.getConfig("user.email")) || "unknown";
+            (await this.gitManager.getConfig("user.email", "all")) || "unknown";
 
         // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
         // webhook URL은 data.json 우선, localStorage 폴백 (2026-04-22 Option-1)
@@ -1978,10 +1979,10 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
         if (webhookUrl) {
             try {
                 const userName =
-                    (await this.gitManager.getConfig("user.name")) ||
+                    (await this.gitManager.getConfig("user.name", "all")) ||
                     "unknown";
                 const userEmail =
-                    (await this.gitManager.getConfig("user.email")) ||
+                    (await this.gitManager.getConfig("user.email", "all")) ||
                     "unknown";
                 const conflictList = (conflicted ?? []).join(", ");
                 const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
