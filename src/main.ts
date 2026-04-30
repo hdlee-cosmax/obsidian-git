@@ -132,6 +132,18 @@ const MASS_DELETE_THRESHOLD = 30;
 const MODAL_AUTO_CLOSE_MS = 10000;
 
 /**
+ * 빌드 식별자. Discord 알람 prefix에 박혀 어느 빌드가 발사했는지 즉시 식별.
+ * 빌드/배포 시점마다 수동 갱신.
+ */
+const PLUGIN_REVISION = "2026-04-30-autoresolve+ratelimit";
+
+/**
+ * preflight 알람 Discord rate-limit (ms). 자동 정리 안 되는 진짜 잔존 stash 케이스에서
+ * 노이즈를 줄이기 위해 1시간 1회로 제한. Modal은 rate-limit과 무관하게 매번 발사.
+ */
+const PREFLIGHT_ALERT_RATE_LIMIT_MS = 60 * 60 * 1000;
+
+/**
  * 사전검사 danger 정보 타입.
  */
 interface PreflightDanger {
@@ -1296,19 +1308,25 @@ export default class ObsidianGit extends Plugin {
 
     /**
      * 사전검사 위험 감지 시 디스코드 + Obsidian Modal 동시 발사.
-     * - de-dup 없음 (사용자 결정: 10분마다 반복 알림)
+     * - Discord: rate-limit 1시간 (자동 정리 안 되는 진짜 잔존 stash 노이즈 차단)
+     * - Modal: rate-limit 무관 매번 발사 (사고 PC 본인 인지)
      * - 둘 다 실패해도 사이클 스킵 로직은 영향 없음
      */
+    _preflightAlertLastFired = 0;
     async _emitPreflightAlert(danger: PreflightDanger): Promise<void> {
         const userName =
             (await this.gitManager.getConfig("user.name", "all")) || "unknown";
         const userEmail =
             (await this.gitManager.getConfig("user.email", "all")) || "unknown";
 
-        // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달)
+        // (1) 디스코드 알림 (외부 인지, 휴대폰 푸시 도달) — rate-limit 1시간
         // webhook URL은 data.json 우선, localStorage 폴백 (2026-04-22 Option-1)
+        const now = Date.now();
+        const shouldFireDiscord =
+            now - this._preflightAlertLastFired >=
+            PREFLIGHT_ALERT_RATE_LIMIT_MS;
         const { webhookUrl, mentionId } = getCaptainHookConfig(this);
-        if (webhookUrl) {
+        if (webhookUrl && shouldFireDiscord) {
             try {
                 const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
                 await requestUrl({
@@ -1316,14 +1334,16 @@ export default class ObsidianGit extends Plugin {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName} (${userEmail})\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
+                        content: `${mentionPrefix}**${danger.prefix}** \`${PLUGIN_REVISION}\`\n사용자: ${userName} (${userEmail})\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
                     }),
                 });
+                this._preflightAlertLastFired = now;
             } catch (_e) {
                 // 네트워크 차단 등 — 사이클 차단까진 안 하도록 무시
+                // lastFired는 갱신하지 않음 → 다음 사이클에서 재시도 가능
             }
         }
-        // webhook URL이 설정되지 않은 PC: 디스코드 silent skip, Modal은 그대로 발사
+        // webhook URL 미설정 또는 rate-limit hit: 디스코드 silent skip, Modal은 그대로 발사
 
         // (2) Obsidian Modal 팝업 (확인 버튼 없음, 10초 자동 닫힘)
         try {
