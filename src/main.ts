@@ -992,8 +992,23 @@ export default class ObsidianGit extends Plugin {
             const stashMsg = `${OBSIDIAN_GIT_AUTOSTASH_TAG} ${new Date().toISOString()} ${userName}`;
             let stashed = false;
             try {
-                await gm.git.stash(["push", "-u", "-m", stashMsg]);
-                stashed = true;
+                const stashResult = await gm.git.stash([
+                    "push",
+                    "-u",
+                    "-m",
+                    stashMsg,
+                ]);
+                // Codex 리뷰 P1 (2026-05-18): simple-git의 stash push는 변경이 없어도
+                // throw하지 않고 "No local changes to save\n" 문자열을 반환한다
+                // (exit=0). 무조건 stashed=true로 두면 변경 없는 사이클마다 Phase 3
+                // pop이 "No stash entries found"로 throw → displayError 호출되어
+                // false-positive 에러 표시. 결과 문자열을 검사해 실제 stash 생성
+                // 여부를 판별한다.
+                const resultStr =
+                    typeof stashResult === "string" ? stashResult : "";
+                if (!resultStr.includes("No local changes")) {
+                    stashed = true;
+                }
             } catch (e) {
                 const msg = (e as Error)?.message ?? "";
                 if (!msg.includes("No local changes")) {
@@ -1003,7 +1018,8 @@ export default class ObsidianGit extends Plugin {
                     });
                     return;
                 }
-                // "No local changes to save"만 무시
+                // "No local changes to save" throw 분기는 구버전 simple-git
+                // 호환용 보존 (현재 버전은 throw 안 함 — 위 결과 문자열 분기가 처리)
             }
 
             // ===== Phase 2: pull =====
