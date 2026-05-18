@@ -527,10 +527,7 @@ export class SimpleGit extends GitManager {
             }
         } catch (e) {
             // fail-open: guard 에러 시 sync 계속 (sentinel이 reactive backstop)
-            console.error(
-                "[obsidian-git] plugin-path primary-guard error:",
-                e
-            );
+            console.error("[obsidian-git] plugin-path primary-guard error:", e);
         }
 
         this.plugin.setPluginState({ gitAction: CurrentGitAction.commit });
@@ -697,11 +694,19 @@ export class SimpleGit extends GitManager {
                                 await this.git.rebase(args);
                         }
                     } catch (err) {
-                        this.plugin.displayError(
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-                            `Pull failed (${this.plugin.settings.syncMethod}): ${"message" in err ? err.message : err}`
+                        // Codex 리뷰 P1-2 (2026-05-18): 기존엔 displayError 후 return; 으로
+                        // 실패를 swallow → main.pull()이 [] 받아 0 반환 → commitAndSync가
+                        // pullResult !== false 로 판단하여 stash pop 단계까지 진행, 충돌 누적.
+                        // displayError는 호출자(main.pull())의 catch에서 처리하므로 여기선 throw만.
+                        // 메시지에 syncMethod 컨텍스트 보존을 위해 새 Error로 래핑.
+                        const message =
+                            err && typeof err === "object" && "message" in err
+                                ? // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+                                  String(err.message)
+                                : String(err);
+                        throw new Error(
+                            `Pull failed (${this.plugin.settings.syncMethod}): ${message}`
                         );
-                        return;
                     }
                 } else if (this.plugin.settings.syncMethod === "reset") {
                     try {

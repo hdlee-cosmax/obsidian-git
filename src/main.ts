@@ -106,15 +106,14 @@ function getCaptainHookConfig(plugin: {
     settings: ObsidianGit["settings"];
 }): { webhookUrl: string | null; mentionId: string | null } {
     const settingsUrl = plugin.settings.captainHookWebhookUrl?.trim() || null;
-    const settingsMention = plugin.settings.captainHookMentionId?.trim() || null;
+    const settingsMention =
+        plugin.settings.captainHookMentionId?.trim() || null;
     const lsUrl =
-        plugin.app.loadLocalStorage(
-            "obsidian-git:captainHookWebhookUrl"
-        ) ?? null;
+        plugin.app.loadLocalStorage("obsidian-git:captainHookWebhookUrl") ??
+        null;
     const lsMention =
-        plugin.app.loadLocalStorage(
-            "obsidian-git:captainHookMentionId"
-        ) ?? null;
+        plugin.app.loadLocalStorage("obsidian-git:captainHookMentionId") ??
+        null;
     return {
         webhookUrl: settingsUrl || lsUrl,
         mentionId: settingsMention || lsMention,
@@ -124,7 +123,7 @@ function getCaptainHookConfig(plugin: {
 /**
  * mass-delete 임계치. Phase 0과 Phase 0.5에서 동일 값 사용.
  */
-const MASS_DELETE_THRESHOLD = 30;
+const MASS_DELETE_THRESHOLD = 100;
 
 /**
  * Modal 자동 닫힘 시간 (ms). 확인 버튼 없이 10초 후 자동 close.
@@ -162,7 +161,7 @@ class PreflightWarningModal extends Modal {
         contentEl.empty();
         contentEl.createEl("p", { text: this.detail });
         contentEl.createEl("p", {
-            text: "auto-commit 사이클이 스킵되었습니다. 즉시 이한덕에게 문의하세요.",
+            text: "auto-commit 사이클이 스킵되었습니다. 옵시디언 작업 중인 Claude에게 해당 git 이슈 수정을 요청하세요. 해결되지 않으면 이한덕에게 문의하세요.",
         });
         contentEl.createEl("p", {
             text: "auto-pull은 영향 없이 정상 동작합니다. 정리 전까지 10분마다 이 알림이 반복됩니다.",
@@ -942,11 +941,7 @@ export default class ObsidianGit extends Plugin {
                         .filter((p) => p.startsWith(PLUGIN_PATH_PREFIX));
                     if (pluginFiles.length > 0) {
                         try {
-                            await gm.git.reset([
-                                "HEAD",
-                                "--",
-                                ...pluginFiles,
-                            ]);
+                            await gm.git.reset(["HEAD", "--", ...pluginFiles]);
                         } catch (_e) {
                             // reset 실패해도 primary guard가 fallback
                         }
@@ -1151,7 +1146,7 @@ export default class ObsidianGit extends Plugin {
      * - 검사 1-B: 사용자 stash 잔존
      * - 검사 1-mix: 혼재
      * - 검사 2: rebase/merge/cherry-pick 중단
-     * - 검사 3: 대량 삭제 (30개 이상)
+     * - 검사 3: 대량 삭제 (100개 이상)
      *
      * 데스크톱 SimpleGit 경로 전용. 모바일은 호출되지 않음.
      */
@@ -1159,9 +1154,20 @@ export default class ObsidianGit extends Plugin {
         if (!(this.gitManager instanceof SimpleGit)) return null;
         const gm = this.gitManager;
 
-        // ===== Phase 0: 자동 정리 — 빈 stash + reverse-applicable autostash drop =====
+        // ===== Phase 0a: mid-rebase 자동 abort (안전 조건 충족 시) =====
+        // sync-repos.sh의 검증된 패턴 포팅 (09번 §3.2). Obsidian Git auto-pull은
+        // 무인 rebase이므로, 사용자 수동 conflict resolution 흔적이 없으면 abort해도
+        // working tree 손실 없음 — 다음 auto-pull이 자연스럽게 재시도한다.
+        try {
+            await this._autoAbortMidRebase(gm);
+        } catch (_e) {
+            // 자동 abort 실패는 무시 — 검사 2에서 알람 발사
+        }
+
+        // ===== Phase 0b: 자동 정리 — 빈 stash + reverse-applicable autostash drop =====
         // 빈 patch는 autostash/사용자 stash 모두 drop. autostash 중 워킹트리에
         // reverse-applicable(=이미 반영됨)한 entry도 drop. 알람 발사 전 cleanup.
+        // Phase 0a abort 직후 잔존 autostash까지 한 번에 정리되도록 순서 고정.
         try {
             await this._autoResolveStashes(gm);
         } catch (_e) {
@@ -1260,10 +1266,7 @@ export default class ObsidianGit extends Plugin {
                 const adapter = this.app.vault.adapter as FileSystemAdapter;
                 const vaultRelativePath = path.isAbsolute(rebaseMergePath)
                     ? normalizePath(
-                          path.relative(
-                              adapter.getBasePath(),
-                              rebaseMergePath
-                          )
+                          path.relative(adapter.getBasePath(), rebaseMergePath)
                       )
                     : gm.getRelativeVaultPath(rebaseMergePath);
                 if (await adapter.exists(vaultRelativePath)) {
@@ -1316,7 +1319,7 @@ export default class ObsidianGit extends Plugin {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName} (${userEmail})\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 즉시 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
+                        content: `${mentionPrefix}**${danger.prefix}**\n사용자: ${userName} (${userEmail})\n사유: ${danger.detail}\n→ auto-commit 사이클을 스킵합니다. 옵시디언 작업 중인 Claude에게 해당 git 이슈 수정을 요청하세요. 해결되지 않으면 이한덕에게 문의하세요.\n(auto-pull은 정상 동작합니다)`,
                     }),
                 });
             } catch (_e) {
@@ -1338,7 +1341,82 @@ export default class ObsidianGit extends Plugin {
     }
 
     /**
-     * 사전검사 Phase 0: 알람 발사 전 자동 정리 가능한 stash 제거.
+     * 사전검사 Phase 0a: mid-rebase 자동 abort.
+     *
+     * sync-repos.sh의 검증된 패턴 포팅 (09번 §3.2 `git rebase --abort 2>/dev/null`).
+     * Obsidian Git auto-pull은 무인 `pull --rebase --autostash`이므로, 정상 흐름에서
+     * mid-rebase 발생 시 working tree는 비어있다 (autostash가 변경분을 stash로 옮겨놓음).
+     * 즉 working tree가 완전히 clean이면 자동 발생한 mid-rebase로 보고 abort.
+     *
+     * 안전 조건 (모두 충족 시에만 abort 실행):
+     * - 워킹트리 전체 clean (`status.files.length === 0`)
+     *   - staged/conflicted뿐 아니라 modified/not_added/deleted/renamed 포함
+     *   - `git rebase --abort`는 내부적으로 `reset --hard ORIG_HEAD` → unstaged 손실 위험
+     *   - Codex 리뷰 P1-1 (2026-05-18): unstaged 보호 누락 회귀 방지
+     *
+     * 안전 조건 위반 시 abort 스킵 → 후속 검사 2에서 알람 발사 (사용자 수동 검토).
+     * 검사 2와 검출 로직은 의도적으로 중복 (관심사 분리 — abort vs 알람 발사).
+     */
+    private async _autoAbortMidRebase(gm: SimpleGit): Promise<void> {
+        // 1) mid-rebase 여부 검출 — REBASE_HEAD ref + rebase-merge 디렉터리 양쪽
+        let inRebase = false;
+        try {
+            const out = await gm.git.revparse([
+                "--verify",
+                "--quiet",
+                "REBASE_HEAD",
+            ]);
+            if (out && out.trim().length > 0) inRebase = true;
+        } catch (_e) {
+            // ref 부재 시 throw — 정상
+        }
+        if (!inRebase) {
+            try {
+                const rebaseMergePath = (
+                    await gm.git.revparse(["--git-path", "rebase-merge"])
+                ).trim();
+                if (rebaseMergePath) {
+                    const adapter = this.app.vault.adapter as FileSystemAdapter;
+                    const vaultRelativePath = path.isAbsolute(rebaseMergePath)
+                        ? normalizePath(
+                              path.relative(
+                                  adapter.getBasePath(),
+                                  rebaseMergePath
+                              )
+                          )
+                        : gm.getRelativeVaultPath(rebaseMergePath);
+                    if (await adapter.exists(vaultRelativePath))
+                        inRebase = true;
+                }
+            } catch (_e) {
+                // best-effort
+            }
+        }
+        if (!inRebase) return;
+
+        // 2) 안전 조건 검사 — 워킹트리 전체 clean 요구
+        // `git rebase --abort`는 내부적으로 `reset --hard ORIG_HEAD`이므로
+        // staged/conflicted뿐 아니라 modified/not_added/deleted/renamed도 모두 손실.
+        // files 배열은 위 카테고리 전부를 포함하는 통합 리스트.
+        try {
+            const status = await gm.git.status();
+            if (status.files.length > 0) {
+                return; // 워킹트리에 어떤 변경이라도 있으면 보존
+            }
+        } catch (_e) {
+            return; // status 실패 시 보수적으로 abort 안 함
+        }
+
+        // 3) abort 실행 (실패해도 무시 — 검사 2가 알람 발사)
+        try {
+            await gm.git.raw(["rebase", "--abort"]);
+        } catch (_e) {
+            // best-effort
+        }
+    }
+
+    /**
+     * 사전검사 Phase 0b: 알람 발사 전 자동 정리 가능한 stash 제거.
      *
      * - 빈 patch (autostash/사용자 stash 무관): 의미 없으므로 drop.
      * - autostash + reverse-applicable patch: 변경분이 이미 워킹트리에 반영됐음 → drop.
@@ -1362,11 +1440,7 @@ export default class ObsidianGit extends Plugin {
 
             let patch = "";
             try {
-                const result = await gm.git.stash([
-                    "show",
-                    "-p",
-                    stashRef,
-                ]);
+                const result = await gm.git.stash(["show", "-p", stashRef]);
                 patch = typeof result === "string" ? result : "";
             } catch (_e) {
                 continue; // patch 추출 실패 → 보수적 keep
@@ -2114,7 +2188,7 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
                 const conflictList = (conflicted ?? []).join(", ");
                 const mentionPrefix = mentionId ? `<@${mentionId}> ` : "";
                 const chainWarning = fromStashPop
-                    ? `\n⚠️ stash 잔존 상태 — 다음 사이클부터 "Autostash unresolved" 알림이 10분마다 반복됩니다. 정리까지 이한덕에게 문의하세요.`
+                    ? `\n⚠️ stash 잔존 상태 — 다음 사이클부터 "Autostash unresolved" 알림이 10분마다 반복됩니다. 옵시디언 작업 중인 Claude에게 정리를 요청하세요. 해결되지 않으면 이한덕에게 문의하세요.`
                     : "";
                 const content =
                     `${mentionPrefix}**⚠️ Vault Git 충돌 발생!**\n` +
