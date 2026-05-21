@@ -126,11 +126,6 @@ function getCaptainHookConfig(plugin: {
 const MASS_DELETE_THRESHOLD = 100;
 
 /**
- * Modal 자동 닫힘 시간 (ms). 확인 버튼 없이 10초 후 자동 close.
- */
-const MODAL_AUTO_CLOSE_MS = 10000;
-
-/**
  * 사전검사 danger 정보 타입.
  */
 interface PreflightDanger {
@@ -139,15 +134,26 @@ interface PreflightDanger {
 }
 
 /**
+ * AppleScript 문자열 literal escape.
+ * macOS 시스템 알림 본문에 사용자 이름/파일 경로/에러 문구가 들어가므로
+ * 따옴표와 역슬래시를 안전하게 보존한다.
+ */
+function escapeAppleScriptString(text: string): string {
+    return text
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/\r?\n/g, " ");
+}
+
+/**
  * 사전검사 경고용 Obsidian Modal.
- * - 확인 버튼 없음
- * - 10초 후 자동 close (setTimeout)
- * - ESC 키 또는 바깥 클릭으로 즉시 close (Obsidian 기본 동작)
+ * - 자동 close 없음
+ * - 사용자가 확인 버튼을 눌러 닫을 때까지 유지
  */
 class PreflightWarningModal extends Modal {
     private prefix: string;
     private detail: string;
-    private autoCloseTimer: number | null = null;
+    private closeConfirmed = false;
 
     constructor(app: ObsidianGit["app"], prefix: string, detail: string) {
         super(app);
@@ -169,17 +175,23 @@ class PreflightWarningModal extends Modal {
                 style: "color: var(--text-muted); font-size: 0.85em;",
             },
         });
-        // 확인 버튼 없음 — 10초 후 자동 닫힘
-        this.autoCloseTimer = window.setTimeout(() => {
+        const buttonRow = contentEl.createDiv({
+            cls: "modal-button-container",
+        });
+        const confirmButton = buttonRow.createEl("button", { text: "확인" });
+        confirmButton.addClass("mod-cta");
+        confirmButton.addEventListener("click", () => {
+            this.closeConfirmed = true;
             this.close();
-        }, MODAL_AUTO_CLOSE_MS);
+        });
+    }
+
+    close(): void {
+        if (!this.closeConfirmed) return;
+        super.close();
     }
 
     onClose(): void {
-        if (this.autoCloseTimer !== null) {
-            window.clearTimeout(this.autoCloseTimer);
-            this.autoCloseTimer = null;
-        }
         this.contentEl.empty();
     }
 }
@@ -1344,7 +1356,10 @@ export default class ObsidianGit extends Plugin {
         }
         // webhook URL이 설정되지 않은 PC: 디스코드 silent skip, Modal은 그대로 발사
 
-        // (2) Obsidian Modal 팝업 (확인 버튼 없음, 10초 자동 닫힘)
+        // (2) macOS 시스템 알림. Obsidian 창이 뒤에 있어도 사용자가 인지할 수 있게 함.
+        await this._emitMacSystemNotification(danger, userName, userEmail);
+
+        // (3) Obsidian Modal 팝업 (확인 버튼으로 수동 닫기)
         try {
             new PreflightWarningModal(
                 this.app,
@@ -1353,6 +1368,39 @@ export default class ObsidianGit extends Plugin {
             ).open();
         } catch (_e) {
             // Modal 생성 실패도 무시
+        }
+    }
+
+    /**
+     * macOS 시스템 알림.
+     *
+     * Obsidian Modal은 앱 창 안에만 떠서 사용자가 다른 창을 보고 있으면 놓치기 쉽다.
+     * 전원 Mac 운영 환경이므로 `osascript display notification`을 best-effort로 병행한다.
+     */
+    private async _emitMacSystemNotification(
+        danger: PreflightDanger,
+        userName: string,
+        userEmail: string
+    ): Promise<void> {
+        if (!Platform.isDesktopApp || !Platform.isMacOS) return;
+
+        const title = "Captain Hook";
+        const subtitle = danger.prefix;
+        const body =
+            `사용자: ${userName} (${userEmail}) / ` +
+            `사유: ${danger.detail} / ` +
+            "auto-commit 스킵됨";
+
+        try {
+            await spawnAsync("osascript", [
+                "-e",
+                `display notification "${escapeAppleScriptString(body)}" ` +
+                    `with title "${escapeAppleScriptString(title)}" ` +
+                    `subtitle "${escapeAppleScriptString(subtitle)}" ` +
+                    'sound name "Glass"',
+            ]);
+        } catch (_e) {
+            // 시스템 알림 실패는 핵심 sync 흐름에 영향 주지 않음
         }
     }
 
