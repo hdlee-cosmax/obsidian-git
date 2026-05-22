@@ -1489,6 +1489,7 @@ export default class ObsidianGit extends Plugin {
      *
      * - 빈 patch (autostash/사용자 stash 무관): 의미 없으므로 drop.
      * - autostash + reverse-applicable patch: 변경분이 이미 워킹트리에 반영됐음 → drop.
+     * - autostash + forward-applicable patch: 충돌 없이 적용 가능 → apply 후 drop.
      * - 사용자 stash + 내용 있음: 의도 보존을 위해 절대 drop 금지.
      *
      * 큰 인덱스부터 처리한다 — drop 시 작은 인덱스 stash@{N}은 영향 없음.
@@ -1541,7 +1542,51 @@ export default class ObsidianGit extends Plugin {
                 continue;
             }
 
-            // 3) 그 외 — 보수적 keep (검사 1에서 알람 발사)
+            // 3) autostash + forward-applicable — 충돌 없이 복원 가능, apply 후 drop
+            if (isAuto && (await this._isPatchApplicable(gm, patch))) {
+                try {
+                    const status = await gm.git.status();
+                    if (status.conflicted.length > 0) continue;
+
+                    await gm.git.stash(["apply", stashRef]);
+                    await gm.git.stash(["drop", stashRef]);
+                } catch (_e) {
+                    /* keep on failure */
+                }
+                continue;
+            }
+
+            // 4) 그 외 — 보수적 keep (검사 1에서 알람 발사)
+        }
+    }
+
+    /**
+     * patch가 현재 워킹트리에 충돌 없이 적용 가능한가?
+     * 통과 시 자동 stash를 `apply` 후 `drop` 해도 되는 기계적 안전 조건이다.
+     */
+    private async _isPatchApplicable(
+        gm: SimpleGit,
+        patch: string
+    ): Promise<boolean> {
+        if (!patch || patch.trim() === "") return false;
+        const tmpFile = path.join(
+            os.tmpdir(),
+            `obsidian-git-stash-${Date.now()}-${Math.random()
+                .toString(36)
+                .slice(2, 8)}.patch`
+        );
+        try {
+            fs.writeFileSync(tmpFile, patch, "utf8");
+            await gm.git.raw(["apply", "--check", tmpFile]);
+            return true;
+        } catch (_e) {
+            return false;
+        } finally {
+            try {
+                fs.unlinkSync(tmpFile);
+            } catch (_e) {
+                /* ignore */
+            }
         }
     }
 
