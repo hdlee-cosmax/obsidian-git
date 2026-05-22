@@ -81,6 +81,7 @@ import { EditorIntegration } from "./editor/editorIntegration";
  * substring 매칭으로 사용한다. 정규식 금지, 하이픈 변형 금지.
  */
 const OBSIDIAN_GIT_AUTOSTASH_TAG = "obsidian-git autostash";
+const GIT_NATIVE_AUTOSTASH_TAG = "autostash";
 
 /**
  * Captain Hook 알림 설정은 **data.json 우선, localStorage 폴백** 순서로 읽는다.
@@ -143,6 +144,14 @@ function escapeAppleScriptString(text: string): string {
         .replace(/\\/g, "\\\\")
         .replace(/"/g, '\\"')
         .replace(/\r?\n/g, " ");
+}
+
+function isAutomaticStashLine(line: string): boolean {
+    const normalized = line.toLowerCase();
+    return (
+        normalized.includes(OBSIDIAN_GIT_AUTOSTASH_TAG) ||
+        normalized.includes(GIT_NATIVE_AUTOSTASH_TAG)
+    );
 }
 
 /**
@@ -1229,12 +1238,8 @@ export default class ObsidianGit extends Plugin {
                     })
                     .filter((s) => s.length > 0);
             }
-            const autoLines = lines.filter((l) =>
-                l.includes(OBSIDIAN_GIT_AUTOSTASH_TAG)
-            );
-            const userLines = lines.filter(
-                (l) => !l.includes(OBSIDIAN_GIT_AUTOSTASH_TAG)
-            );
+            const autoLines = lines.filter(isAutomaticStashLine);
+            const userLines = lines.filter((l) => !isAutomaticStashLine(l));
             if (autoLines.length > 0 && userLines.length > 0) {
                 return {
                     prefix: "⚠️ Stash unresolved (mixed)",
@@ -1500,11 +1505,17 @@ export default class ObsidianGit extends Plugin {
 
         for (let i = lines.length - 1; i >= 0; i--) {
             const stashRef = `stash@{${i}}`;
-            const isAuto = lines[i].includes(OBSIDIAN_GIT_AUTOSTASH_TAG);
+            const isAuto = isAutomaticStashLine(lines[i]);
 
             let patch = "";
             try {
-                const result = await gm.git.stash(["show", "-p", stashRef]);
+                const result = await gm.git.stash([
+                    "show",
+                    "-p",
+                    "--include-untracked",
+                    "--binary",
+                    stashRef,
+                ]);
                 patch = typeof result === "string" ? result : "";
             } catch (_e) {
                 continue; // patch 추출 실패 → 보수적 keep
